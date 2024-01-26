@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/syzkaller/pkg/bisect/minimize"
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/instance"
@@ -93,7 +92,8 @@ func Run(crashLog []byte, cfg *mgrconfig.Config, features *host.Features, report
 	}
 	// Wait until all VMs are really released.
 	defer wg.Wait()
-	ctx.run()
+	defer close(ctx.bootRequests)
+	ctx.analyse()
 	return nil, nil, err
 }
 
@@ -146,14 +146,8 @@ func prepareCtx(crashLog []byte, cfg *mgrconfig.Config, features *host.Features,
 		stats:        new(Stats),
 		timeouts:     cfg.Timeouts,
 	}
-	ctx.reproLogf(0, "%v programs, %v VMs, timeouts %v", len(entries), VMs, testTimeouts)
+	ctx.analyseLogf(0, "%v programs, %v VMs, timeouts %v", len(entries), VMs, testTimeouts)
 	return ctx, nil
-}
-
-func (ctx *context) run() {
-	// Indicate that we no longer need VMs.
-	defer close(ctx.bootRequests)
-	ctx.analyse()
 }
 
 func createStartOptions(cfg *mgrconfig.Config, features *host.Features,
@@ -206,7 +200,7 @@ func (ctx *context) analyse() {
 
 	reproStart := time.Now()
 	defer func() {
-		ctx.reproLogf(3, "reproducing took %s", time.Since(reproStart))
+		ctx.analyseLogf(3, "reproducing took %s", time.Since(reproStart))
 	}()
 
 	for _, timeout := range ctx.testTimeouts {
@@ -214,95 +208,25 @@ func (ctx *context) analyse() {
 	}
 }
 
-func (ctx *context) extractProgAll(entries []*prog.LogEntry, baseDuration time.Duration) {
-	ctx.reproLogf(3, "all: executing %d programs with timeout %s", len(entries), baseDuration)
+func (ctx *context) extractProgAll(entries []*prog.LogEntry, baseDuration time.Duration) (*Result, error) {
+	ctx.analyseLogf(3, "all: executing %d programs with timeout %s", len(entries), baseDuration)
 	opts := ctx.startOpts
 	duration := func(entries int) time.Duration {
 		return baseDuration + time.Duration(entries/4)*time.Second
 	}
 
 	crashed, err := ctx.testProgs(entries, duration(len(entries)), opts)
+	res := &Result{}
 	if crashed {
 		dur := duration(len(entries)) * 3 / 2
-		res := &Result{
+		res = &Result{
 			Prog:     nil, // not only one prog
 			Duration: dur,
 			Opts:     opts,
 		}
-		ctx.reproLogf(3, "executing %d all entries really cause crash.", len(entries))
+		ctx.analyseLogf(3, "executing %d all entries really cause crash.", len(entries))
 	}
-}
-
-// Minimize calls and arguments.
-func (ctx *context) minimizeProg(res *Result) (*Result, error) {
-	ctx.reproLogf(2, "minimizing guilty program")
-	start := time.Now()
-	defer func() {
-		ctx.stats.MinimizeProgTime = time.Since(start)
-	}()
-
-	res.Prog, _ = prog.Minimize(res.Prog, -1, true,
-		func(p1 *prog.Prog, callIndex int) bool {
-			crashed, err := ctx.testProg(p1, res.Duration, res.Opts)
-			if err != nil {
-				ctx.reproLogf(0, "minimization failed with %v", err)
-				return false
-			}
-			return crashed
-		})
-
-	return res, nil
-}
-
-// Simplify repro options (threaded, sandbox, etc).
-func (ctx *context) simplifyProg(res *Result) (*Result, error) {
-	ctx.reproLogf(2, "simplifying guilty program options")
-	start := time.Now()
-	defer func() {
-		ctx.stats.SimplifyProgTime = time.Since(start)
-	}()
-
-	// Do further simplifications.
-	for _, simplify := range progSimplifies {
-		opts := res.Opts
-		if !simplify(&opts) || !checkOpts(&opts, ctx.timeouts, res.Duration) {
-			continue
-		}
-		crashed, err := ctx.testProg(res.Prog, res.Duration, opts)
-		if err != nil {
-			return nil, err
-		}
-		if !crashed {
-			continue
-		}
-		res.Opts = opts
-		// Simplification successful, try extracting C repro.
-		res, err = ctx.extractC(res)
-		if err != nil {
-			return nil, err
-		}
-		if res.CRepro {
-			return res, nil
-		}
-	}
-
-	return res, nil
-}
-
-// Try triggering crash with a C reproducer.
-func (ctx *context) extractC(res *Result) (*Result, error) {
-	ctx.reproLogf(2, "extracting C reproducer")
-	start := time.Now()
-	defer func() {
-		ctx.stats.ExtractCTime = time.Since(start)
-	}()
-
-	crashed, err := ctx.testCProg(res.Prog, res.Duration, res.Opts)
-	if err != nil {
-		return nil, err
-	}
-	res.CRepro = crashed
-	return res, nil
+	return res, err
 }
 
 func checkOpts(opts *csource.Options, timeouts targets.Timeouts, timeout time.Duration) bool {
@@ -373,11 +297,11 @@ func (ctx *context) testWithInstance(callback func(execInterface) (rep *instance
 	}
 
 	if rep.Suppressed {
-		ctx.reproLogf(2, "suppressed program crash: %v", rep.Title)
+		ctx.analyseLogf(2, "suppressed program crash: %v", rep.Title)
 		return false, nil
 	}
 	if ctx.crashType == crash.MemoryLeak && rep.Type != crash.MemoryLeak {
-		ctx.reproLogf(2, "not a leak crash: %v", rep.Title)
+		ctx.analyseLogf(2, "not a leak crash: %v", rep.Title)
 		return false, nil
 	}
 	ctx.report = rep
@@ -422,8 +346,8 @@ func (ctx *context) testProgs(entries []*prog.LogEntry, duration time.Duration, 
 		}
 		program += "]"
 	}
-	ctx.reproLogf(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
-	ctx.reproLogf(4, "detailed listing:\n%s", pstr)
+	ctx.analyseLogf(2, "testing program (duration=%v, %+v): %s", duration, opts, program)
+	ctx.analyseLogf(4, "detailed listing:\n%s", pstr)
 	return ctx.testWithInstance(func(exec execInterface) (*instance.RunResult, error) {
 		return exec.RunSyzProg(pstr, duration, opts)
 	})
@@ -434,40 +358,13 @@ func (ctx *context) returnInstance(inst *reproInstance) {
 	inst.execProg.Close()
 }
 
-func (ctx *context) reproLogf(level int, format string, args ...interface{}) {
+func (ctx *context) analyseLogf(level int, format string, args ...interface{}) {
 	if ctx.logf != nil {
 		ctx.logf(format, args...)
 	}
-	prefix := fmt.Sprintf("reproducing crash '%v': ", ctx.crashTitle)
+	prefix := fmt.Sprintf("analysing crash '%v': ", ctx.crashTitle)
 	log.Logf(level, prefix+format, args...)
 	ctx.stats.Log = append(ctx.stats.Log, []byte(fmt.Sprintf(format, args...)+"\n")...)
-}
-
-func (ctx *context) bisectProgs(progs []*prog.LogEntry, pred func([]*prog.LogEntry) (bool, error)) (
-	[]*prog.LogEntry, error) {
-	// Set up progs bisection.
-	ctx.reproLogf(3, "bisect: bisecting %d programs", len(progs))
-	minimizePred := func(progs []*prog.LogEntry) (bool, error) {
-		// Don't waste time testing empty crash log.
-		if len(progs) == 0 {
-			return false, nil
-		}
-		return pred(progs)
-	}
-	ret, err := minimize.Slice(minimize.Config[*prog.LogEntry]{
-		Pred: minimizePred,
-		// For flaky crashes we usually end up with too many chunks.
-		// Continuing bisection would just take a lot of time and likely produce no result.
-		MaxChunks: 8,
-		Logf: func(msg string, args ...interface{}) {
-			ctx.reproLogf(3, "bisect: "+msg, args...)
-		},
-	}, progs)
-	if err == minimize.ErrTooManyChunks {
-		ctx.reproLogf(3, "bisect: too many guilty chunks, aborting")
-		return nil, nil
-	}
-	return ret, err
 }
 
 func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
@@ -489,9 +386,9 @@ func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
 				}
 				var err error
 				inst, err = instance.CreateExecProgInstance(vmPool, vmIndex, cfg,
-					ctx.reporter, &instance.OptionalConfig{Logf: ctx.reproLogf})
+					ctx.reporter, &instance.OptionalConfig{Logf: ctx.analyseLogf})
 				if err != nil {
-					ctx.reproLogf(0, "failed to init instance: %v, attempt %d/%d",
+					ctx.analyseLogf(0, "failed to init instance: %v, attempt %d/%d",
 						err, try+1, maxTry)
 					time.Sleep(10 * time.Second)
 					continue
@@ -515,9 +412,9 @@ func (ctx *context) saveProg(prog *prog.LogEntry) {
 	folder := fmt.Sprintf("prog-%v", strconv.FormatInt(time.Now().Unix(), 10))
 	err := os.Mkdir(folder, 0755)
 	if err != nil {
-		ctx.reproLogf(1, "create interesting prog folder failed")
+		ctx.analyseLogf(1, "create interesting prog folder failed")
 	} else {
-		ctx.reproLogf(3, "save interesting prog")
+		ctx.analyseLogf(3, "save interesting prog")
 		f, err := os.Create(filepath.Join(folder, "prog"))
 		data := prog.P.Serialize()
 		if err == nil {
@@ -528,11 +425,11 @@ func (ctx *context) saveProg(prog *prog.LogEntry) {
 }
 
 func (ctx *context) saveEntries(entries []*prog.LogEntry) {
-	ctx.reproLogf(3, "save interesting %v progs", len(entries))
+	ctx.analyseLogf(3, "save interesting %v progs", len(entries))
 	folder := fmt.Sprintf("prog-%v", strconv.FormatInt(time.Now().Unix(), 10))
 	err := os.Mkdir(folder, 0755)
 	if err != nil {
-		ctx.reproLogf(1, "create interesting prog folder failed")
+		ctx.analyseLogf(1, "create interesting prog folder failed")
 	} else {
 		for i, ent := range entries {
 			f, err := os.Create(filepath.Join(folder, fmt.Sprintf("prog%v", i)))
@@ -546,11 +443,11 @@ func (ctx *context) saveEntries(entries []*prog.LogEntry) {
 }
 
 func (ctx *context) saveAltTitle(title string) {
-	ctx.reproLogf(3, "save crash tile %v", title)
+	ctx.analyseLogf(3, "save crash tile %v", title)
 	folder := fmt.Sprintf("repro-%v", strconv.FormatInt(time.Now().Unix(), 10))
 	err := os.Mkdir(folder, 0755)
 	if err != nil {
-		ctx.reproLogf(1, "create altTitle reproduce folder failed")
+		ctx.analyseLogf(1, "create altTitle reproduce folder failed")
 	} else {
 		f, err := os.Create(filepath.Join(folder, "description"))
 		if err == nil {
@@ -558,42 +455,6 @@ func (ctx *context) saveAltTitle(title string) {
 			f.Close()
 		}
 	}
-}
-
-type Simplify func(opts *csource.Options) bool
-
-var progSimplifies = []Simplify{
-	func(opts *csource.Options) bool {
-		if opts.Collide || !opts.Threaded {
-			return false
-		}
-		opts.Threaded = false
-		return true
-	},
-	func(opts *csource.Options) bool {
-		if !opts.Repeat {
-			return false
-		}
-		opts.Repeat = false
-		opts.Cgroups = false
-		opts.NetReset = false
-		opts.Procs = 1
-		return true
-	},
-	func(opts *csource.Options) bool {
-		if opts.Procs == 1 {
-			return false
-		}
-		opts.Procs = 1
-		return true
-	},
-	func(opts *csource.Options) bool {
-		if opts.Sandbox == "none" {
-			return false
-		}
-		opts.Sandbox = "none"
-		return true
-	},
 }
 
 var (
