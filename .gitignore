@@ -27,3 +27,6 @@ dashboard/app/.gcloudignore
 
 # vscode
 .vscode
+
+entry-*
+last-*

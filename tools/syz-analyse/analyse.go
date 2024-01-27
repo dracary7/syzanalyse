@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -191,12 +192,36 @@ func createStartOptions(cfg *mgrconfig.Config, features *host.Features,
 func (ctx *context) analyse() {
 	// Cut programs that were executed after crash.
 	// FIXME: May cause errors
+	start := time.Now()
+	defer func() {
+		ctx.stats.ExtractProgTime = time.Since(start)
+	}()
+
 	for i, ent := range ctx.entries {
 		if ent.Start > ctx.crashStart {
 			ctx.entries = ctx.entries[:i]
 			break
 		}
 	}
+
+	// Extract last program on every proc.
+	procs := make(map[int]int)
+	for i, ent := range ctx.entries {
+		procs[ent.Proc] = i
+	}
+	var indices []int
+	for _, idx := range procs {
+		indices = append(indices, idx)
+	}
+	sort.Ints(indices)
+
+	var lastEntries []*prog.LogEntry
+	for i := len(indices) - 1; i >= 0; i-- {
+		lastEntries = append(lastEntries, ctx.entries[indices[i]])
+	}
+
+	ctx.saveLastEntries(lastEntries)
+	ctx.saveEntries()
 
 	reproStart := time.Now()
 	defer func() {
@@ -408,30 +433,32 @@ func (ctx *context) createInstances(cfg *mgrconfig.Config, vmPool *vm.Pool) {
 	}
 }
 
-func (ctx *context) saveProg(prog *prog.LogEntry) {
-	folder := fmt.Sprintf("prog-%v", strconv.FormatInt(time.Now().Unix(), 10))
-	err := os.Mkdir(folder, 0755)
-	if err != nil {
-		ctx.analyseLogf(1, "create interesting prog folder failed")
-	} else {
-		ctx.analyseLogf(3, "save interesting prog")
-		f, err := os.Create(filepath.Join(folder, "prog"))
-		data := prog.P.Serialize()
-		if err == nil {
-			f.Write(data)
-			f.Close()
-		}
-	}
-}
-
-func (ctx *context) saveEntries(entries []*prog.LogEntry) {
-	ctx.analyseLogf(3, "save interesting %v progs", len(entries))
-	folder := fmt.Sprintf("prog-%v", strconv.FormatInt(time.Now().Unix(), 10))
+func (ctx *context) saveLastEntries(entries []*prog.LogEntry) {
+	ctx.analyseLogf(3, "save lastEntries %v progs", len(entries))
+	folder := fmt.Sprintf("last-%v", strconv.FormatInt(time.Now().Unix(), 10))
 	err := os.Mkdir(folder, 0755)
 	if err != nil {
 		ctx.analyseLogf(1, "create interesting prog folder failed")
 	} else {
 		for i, ent := range entries {
+			f, err := os.Create(filepath.Join(folder, fmt.Sprintf("prog%v", i)))
+			data := ent.P.Serialize()
+			if err == nil {
+				f.Write(data)
+				f.Close()
+			}
+		}
+	}
+}
+
+func (ctx *context) saveEntries() {
+	ctx.analyseLogf(3, "save entries %v progs", len(ctx.entries))
+	folder := fmt.Sprintf("entry-%v", strconv.FormatInt(time.Now().Unix(), 10))
+	err := os.Mkdir(folder, 0755)
+	if err != nil {
+		ctx.analyseLogf(1, "create interesting prog folder failed")
+	} else {
+		for i, ent := range ctx.entries {
 			f, err := os.Create(filepath.Join(folder, fmt.Sprintf("prog%v", i)))
 			data := ent.P.Serialize()
 			if err == nil {
